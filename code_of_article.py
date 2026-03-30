@@ -1,7 +1,12 @@
-import os, math, random, heapq
-import networkx as nx, matplotlib.pyplot as plt, numpy as np
+import os
+import math
+import random
+import heapq
+import networkx as nx
+import matplotlib.pyplot as plt
+import numpy as np
 
-# --- КОНФИГУРАЦИЯ ---
+# --- КОНФИГУРАЦИЯ ЭКСПЕРИМЕНТОВ ---
 random.seed(42)
 np.random.seed(42)
 os.makedirs('graphs', exist_ok=True)
@@ -9,36 +14,60 @@ os.makedirs('graphs', exist_ok=True)
 SIZES =[100, 200, 300, 400, 500]
 TRIALS = 15
 ETA_VALUES = np.linspace(0, 0.3, 7)
-# настройка генераторов
 RGG_RADIUS, BA_M, SW_K, SW_P = 0.15, 3, 6, 0.3
 
-# --- УТИЛИТЫ И СЧЕТЧИКИ ---
+# --- СТРУКТУРЫ ДАННЫХ И СЧЕТЧИКИ ---
 class OpCounter:
-    def __init__(self): self.relax = self.push = self.pop = self.comp = 0
-    def total_ops(self): return self.relax + self.push + self.pop + self.comp
+    """Унифицированный счетчик базовых вычислительных операций."""
+    def __init__(self):
+        self.relax = 0  # Количество проверок/релаксаций ребер
+        self.pop = 0    # Количество извлечений из очереди / посещений узлов
+
+    def total_ops(self):
+        return self.relax + self.pop
 
 def euclidean_heuristic(u, v, G):
+    """Евклидова эвристика для алгоритма A*."""
     return math.dist(G.nodes[u]['pos'], G.nodes[v]['pos'])
 
+def update_parent(v, new_p, parent, children):
+    """O(1) обновление родителя с синхронизацией дерева потомков."""
+    old_p = parent.get(v)
+    if old_p == new_p: 
+        return
+    
+    if old_p is not None and old_p in children:
+        children[old_p].discard(v)
+        
+    parent[v] = new_p
+    if new_p is not None:
+        if new_p not in children:
+            children[new_p] = set()
+        children[new_p].add(v)
+
 def compute_initial_tree(G, source):
-    try:
-        lengths, paths = nx.single_source_dijkstra(G, source, weight='weight')
-        d = {v: lengths.get(v, float('inf')) for v in G.nodes()}
-        parent = {v: paths[v][-2] if len(paths[v]) > 1 else None for v in G.nodes()}
-        return d, parent
-    except Exception:
-        return {v: 0 if v == source else float('inf') for v in G.nodes()}, {v: None for v in G.nodes()}
+    """Эталонный пересчет дерева кратчайших путей."""
+    d = {v: float('inf') for v in G.nodes()}
+    parent = {v: None for v in G.nodes()}
+    children = {v: set() for v in G.nodes()}
+    
+    d[source] = 0
+    Q = [(0, source)]
+    
+    while Q:
+        dist_u, u = heapq.heappop(Q)
+        if dist_u > d[u]: continue
+        
+        for v in G.neighbors(u):
+            w = G[u][v]['weight']
+            if d[u] + w < d[v]:
+                d[v] = d[u] + w
+                update_parent(v, u, parent, children)
+                heapq.heappush(Q, (d[v], v))
+                
+    return d, parent, children
 
-def find_descendants(parent, v):
-    descendants, stack = set(), [v]
-    while stack:
-        node = stack.pop()
-        for child, p in parent.items():
-            if p == node and child not in descendants:
-                descendants.add(child); stack.append(child)
-    return descendants
-
-# --- ГЕНЕРАТОРЫ ГРАФОВ ---
+# --- ГЕНЕРАТОРЫ ТОПОЛОГИЙ ---
 def assign_spatial_weights(G, mult_func=lambda: 1.0, min_w=0.0):
     for u, v in G.edges():
         w = math.dist(G.nodes[u]['pos'], G.nodes[v]['pos']) * mult_func()
@@ -47,14 +76,15 @@ def assign_spatial_weights(G, mult_func=lambda: 1.0, min_w=0.0):
 def generate_grid(n):
     side = math.ceil(math.sqrt(n))
     G = nx.convert_node_labels_to_integers(nx.grid_2d_graph(side, side))
-    if G.number_of_nodes() > n: G.remove_nodes_from(range(n, G.number_of_nodes()))
+    if G.number_of_nodes() > n: 
+        G.remove_nodes_from(list(G.nodes())[n:])
     nx.set_node_attributes(G, {node: (node%side, node//side) for node in G.nodes()}, 'pos')
     assign_spatial_weights(G, min_w=0.1)
     return G
 
 def generate_rgg(n, radius=RGG_RADIUS):
     G = nx.convert_node_labels_to_integers(nx.random_geometric_graph(n, radius))
-    assign_spatial_weights(G, lambda: random.uniform(1.0, 1.1))
+    assign_spatial_weights(G, lambda: random.uniform(1.0, 1.2))
     return G
 
 def generate_scale_free(n, m=BA_M):
@@ -72,142 +102,163 @@ def generate_small_world(n, k=SW_K, p=SW_P):
 def generate_mesh(n, extra_edges_ratio=0.05):
     G = generate_grid(n)
     nodes = list(G.nodes())
-    for _ in range(int(G.number_of_nodes() * extra_edges_ratio)):
+    edges_to_add = int(G.number_of_nodes() * extra_edges_ratio)
+    added = 0
+    while added < edges_to_add:
         u, v = random.sample(nodes, 2)
         if not G.has_edge(u, v):
-            G.add_edge(u, v, weight=math.dist(G.nodes[u]['pos'], G.nodes[v]['pos']))
+            dist = math.dist(G.nodes[u]['pos'], G.nodes[v]['pos'])
+            G.add_edge(u, v, weight=dist)
+            added += 1
     return G
 
 generate_ami = lambda n: generate_rgg(n, RGG_RADIUS)
 
-# --- БАЗОВЫЕ АЛГОРИТМЫ (Для сравнения) ---
+# --- БАЗОВЫЕ АЛГОРИТМЫ ---
 def run_dijkstra_with_ops(G, source, c):
-    d, parent = {n: float('inf') for n in G.nodes()}, {n: None for n in G.nodes()}
+    """Честный полный пересчет алгоритмом Дейкстры со строгим учетом операций."""
+    d = {v: float('inf') for v in G.nodes()}
+    parent = {v: None for v in G.nodes()}
     d[source] = 0
     Q = [(0, source)]
-    c.push += 1
+    
     while Q:
         dist_u, u = heapq.heappop(Q)
-        c.pop += 1; c.comp += 1
+        c.pop += 1  # Учет извлечения (посещения узла)
         if dist_u > d[u]: continue
         
         for v in G.neighbors(u):
-            c.relax += 1; c.comp += 1
-            new_dist = d[u] + G[u][v]['weight']
-            if new_dist < d[v]:
-                d[v], parent[v] = new_dist, u
-                heapq.heappush(Q, (new_dist, v))
-                c.push += 1
+            c.relax += 1  # Учет релаксации ребра
+            w = G[u][v]['weight']
+            if d[u] + w < d[v]:
+                d[v] = d[u] + w
+                parent[v] = u
+                heapq.heappush(Q, (d[v], v))
+                
     return d, parent
 
 def run_astar_with_ops(G, source, target, heuristic, c):
+    """Эвристический алгоритм A*."""
     closed_set, g_score = set(), {n: float('inf') for n in G.nodes()}
-    parent, g_score[source] = {n: None for n in G.nodes()}, 0
-    c.comp += 1
-    open_set, open_set_nodes =[(heuristic(source, target), 0, source)], {source}
-    c.push += 1
+    g_score[source] = 0
+    open_set = [(heuristic(source, target, G), 0, source)]
     
     while open_set:
         f_curr, g_curr, curr = heapq.heappop(open_set)
-        c.pop += 1; c.comp += 1
+        c.pop += 1
         if g_curr > g_score[curr]: continue
-        
-        open_set_nodes.discard(curr)
         closed_set.add(curr)
         
-        c.comp += 1
-        if curr == target: return True # Нам важен лишь факт поиска и затраты
+        if curr == target: return True
         
         for neighbor in G.neighbors(curr):
             c.relax += 1
             if neighbor in closed_set: continue
-            
             tentative_g = g_score[curr] + G[curr][neighbor]['weight']
-            c.comp += 1
             if tentative_g < g_score[neighbor]:
-                parent[neighbor], g_score[neighbor] = curr, tentative_g
-                c.comp += 1
-                f_new = tentative_g + heuristic(neighbor, target)
+                g_score[neighbor] = tentative_g
+                f_new = tentative_g + heuristic(neighbor, target, G)
                 heapq.heappush(open_set, (f_new, tentative_g, neighbor))
-                c.push += 1
-                open_set_nodes.add(neighbor)
     raise nx.NetworkXNoPath()
 
-# --- ПРЕДЛАГАЕМЫЙ ИНКРЕМЕНТАЛЬНЫЙ АЛГОРИТМ ---
-def process_edge_decrease(G, d, parent, u, v, w_new, eta, c=None):
-    A_dist, A_parent = set(), set()
-    if c: c.comp += 1
+# --- ИНКРЕМЕНТАЛЬНЫЙ АЛГОРИТМ ---
+def process_edge_decrease(G, d, parent, children, u, v, w_new, eta, c=None):
+    """Сценарий уменьшения веса ребра."""
+    Q = []
+    
     if d[u] + w_new < d[v] * (1 - eta):
-        d[v], parent[v] = d[u] + w_new, u
-        A_dist.add(v); A_parent.add(v)
-        Q = [(d[v], v)]
-        if c: c.push += 1
+        d[v] = d[u] + w_new
+        update_parent(v, u, parent, children)
+        heapq.heappush(Q, (d[v], v))
         
-        while Q:
-            dist_x, x = heapq.heappop(Q)
-            if c: c.pop += 1; c.comp += 1
-            if dist_x > d[x]: continue
-            
-            for y in G.neighbors(x):
-                if c: c.relax += 1; c.comp += 1
-                if d[x] + G[x][y]['weight'] < d[y] * (1 - eta):
-                    old_d = d[y]
-                    d[y] = d[x] + G[x][y]['weight']
-                    if d[y] != old_d: A_dist.add(y)
-                    if parent[y] != x: parent[y] = x; A_parent.add(y)
-                    heapq.heappush(Q, (d[y], y))
-                    if c: c.push += 1
-    return A_dist, A_parent
+    if d[v] + w_new < d[u] * (1 - eta):
+        d[u] = d[v] + w_new
+        update_parent(u, v, parent, children)
+        heapq.heappush(Q, (d[u], u))
+        
+    while Q:
+        dist_x, x = heapq.heappop(Q)
+        if c: c.pop += 1
+        if dist_x > d[x]: continue
+        
+        for y in G.neighbors(x):
+            if c: c.relax += 1
+            w = G[x][y]['weight']
+            if d[x] + w < d[y] * (1 - eta):
+                d[y] = d[x] + w
+                update_parent(y, x, parent, children)
+                heapq.heappush(Q, (d[y], y))
 
-def process_edge_increase(G, d, parent, u, v, w_new, eta, c=None):
-    A_dist, A_parent = set(), set()
-    if c: c.comp += 1
-    if parent.get(v) != u: return A_dist, A_parent # Изменение не влияет на дерево
+def process_edge_increase(G, d, parent, children, u, v, eta, c=None):
+    """Сценарий увеличения веса или удаления ребра."""
+    roots_to_clear =[]
+    if parent.get(v) == u: roots_to_clear.append(v)
+    if parent.get(u) == v: roots_to_clear.append(u)
     
-    # Фаза 1: Очистка поддерева
-    descendants = find_descendants(parent, v)
-    descendants.add(v)
+    if not roots_to_clear: return
+    
+    descendants = set()
+    for root in roots_to_clear:
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            if c: c.pop += 1
+            descendants.add(node)
+            stack.extend(children.get(node, set()))
+            
     for z in descendants:
-        if d[z] != float('inf'): A_dist.add(z)
-        if parent.get(z) is not None: A_parent.add(z)
-        d[z], parent[z] = float('inf'), None
-    
-    # Фаза 2: Поиск альтернатив через границу
+        d[z] = float('inf')
+        update_parent(z, None, parent, children)
+        
     boundary_candidates =[]
     for z in descendants:
         for y in G.neighbors(z):
             if c: c.relax += 1
             if y not in descendants and d[y] != float('inf'):
-                if c: c.comp += 1
-                if d[y] + G[y][z]['weight'] < d[z]:
-                    d[z], parent[z] = d[y] + G[y][z]['weight'], y
+                w = G[y][z]['weight']
+                if d[y] + w < d[z]:
+                    d[z] = d[y] + w
+                    update_parent(z, y, parent, children)
                     boundary_candidates.append(z)
-                    A_dist.add(z); A_parent.add(z)
-    
-    # Фаза 3: Распространение волны
+                    
     if boundary_candidates:
         Q = [(d[z], z) for z in boundary_candidates]
         heapq.heapify(Q)
-        if c: c.push += len(boundary_candidates)
         
         while Q:
             dist_x, x = heapq.heappop(Q)
-            if c: c.pop += 1; c.comp += 1
+            if c: c.pop += 1
             if dist_x > d[x]: continue
             
             for y in G.neighbors(x):
-                if c: c.relax += 1; c.comp += 1
-                if d[x] + G[x][y]['weight'] < d[y] * (1 - eta):
-                    old_d = d[y]
-                    d[y] = d[x] + G[x][y]['weight']
-                    if d[y] != old_d: A_dist.add(y)
-                    if parent[y] != x: parent[y] = x; A_parent.add(y)
+                if c: c.relax += 1
+                w = G[x][y]['weight']
+                if d[x] + w < d[y] * (1 - eta):
+                    d[y] = d[x] + w
+                    update_parent(y, x, parent, children)
                     heapq.heappush(Q, (d[y], y))
-                    if c: c.push += 1
-    return A_dist, A_parent
 
-# --- ЭКСПЕРИМЕНТЫ ---
+# --- ОБЕРТКИ СПЕЦИФИЧЕСКИХ СЦЕНАРИЕВ ИЗМЕНЕНИЙ ---
+def process_edge_removal(G, d, parent, children, u, v, eta, c=None):
+    G.remove_edge(u, v)
+    process_edge_increase(G, d, parent, children, u, v, eta, c)
+
+def process_edge_addition(G, d, parent, children, u, v, w, eta, c=None):
+    G.add_edge(u, v, weight=w)
+    process_edge_decrease(G, d, parent, children, u, v, w, eta, c)
+
+def process_node_failure(G, d, parent, children, node, eta, c=None):
+    neighbors = list(G.neighbors(node))
+    for nbr in neighbors:
+        process_edge_removal(G, d, parent, children, node, nbr, eta, c)
+
+# --- ЭКСПЕРИМЕНТЫ И СБОР МЕТРИК ---
+def get_affected_metrics(G, old_p, new_p):
+    A_parent = {n for n in G.nodes() if old_p.get(n) != new_p.get(n)}
+    return len(A_parent)
+
 def experiment_complexity():
+    """Сравнение вычислительной сложности алгоритмов (Эксперимент 1)."""
     results = {'sizes': [], 'full':[], 'astar': [], 'inc':[]}
     generators = {'Grid': generate_grid, 'RGG': generate_rgg, 
                   'ScaleFree': generate_scale_free, 'SmallWorld': generate_small_world}
@@ -217,40 +268,34 @@ def experiment_complexity():
         for _ in range(TRIALS):
             g_type = random.choice(list(generators.keys()))
             G = generators[g_type](n_nodes)
-            if G.number_of_nodes() < 2: continue
+            if not G.edges(): continue
             
-            nodes = list(G.nodes())
-            src, target = nodes[0], nodes[-1]
+            src, target = list(G.nodes())[0], list(G.nodes())[-1]
             
-            # 1. Dijkstra
             c_full = OpCounter()
             run_dijkstra_with_ops(G, src, c_full)
             f_ops.append(c_full.total_ops())
             
-            # 2. A*
             c_astar = OpCounter()
             try:
-                run_astar_with_ops(G, src, target, lambda u, v: euclidean_heuristic(u, v, G), c_astar)
+                run_astar_with_ops(G, src, target, euclidean_heuristic, c_astar)
                 a_ops.append(c_astar.total_ops())
-            except Exception:
-                a_ops.append(n_nodes * 5)
+            except nx.NetworkXNoPath:
+                a_ops.append(c_full.total_ops())
                 
-            # 3. Инкрементальный
-            edges = list(G.edges())
-            if edges:
-                u, v = random.choice(edges)
-                old_w = G[u][v]['weight']
-                new_w = old_w * random.uniform(0.5, 1.5)
-                d_curr, parent_curr = compute_initial_tree(G, src)
-                
-                G[u][v]['weight'] = new_w
-                c_inc = OpCounter()
-                if new_w < old_w: process_edge_decrease(G, d_curr, parent_curr, u, v, new_w, 0.0, c_inc)
-                else:             process_edge_increase(G, d_curr, parent_curr, u, v, new_w, 0.0, c_inc)
-                i_ops.append(c_inc.total_ops())
-                G[u][v]['weight'] = old_w
+            u, v = random.choice(list(G.edges()))
+            old_w = G[u][v]['weight']
+            new_w = old_w * random.uniform(0.5, 1.5)
+            
+            d_curr, parent_curr, children_curr = compute_initial_tree(G, src)
+            G[u][v]['weight'] = new_w
+            
+            c_inc = OpCounter()
+            if new_w < old_w:
+                process_edge_decrease(G, d_curr, parent_curr, children_curr, u, v, new_w, 0.0, c_inc)
             else:
-                i_ops.append(0)
+                process_edge_increase(G, d_curr, parent_curr, children_curr, u, v, 0.0, c_inc)
+            i_ops.append(c_inc.total_ops())
                 
         results['sizes'].append(n_nodes)
         results['full'].append(np.mean(f_ops))
@@ -259,6 +304,7 @@ def experiment_complexity():
     return results
 
 def experiment_stability():
+    """Исследование стабильности топологии и влияния порога eta (Эксперименты 2, 3, 4)."""
     results = {'eta': ETA_VALUES, 'churn': [], 'stretch':[]}
     n_nodes, n_events = 200, 30
     
@@ -267,94 +313,107 @@ def experiment_stability():
         for _ in range(TRIALS):
             G = generate_grid(n_nodes)
             src = list(G.nodes())[0]
-            d_opt, parent_opt = compute_initial_tree(G, src)
-            d_curr, parent_curr = d_opt.copy(), parent_opt.copy()
+            
+            d_curr, parent_curr, children_curr = compute_initial_tree(G, src)
             total_churn, total_stretch, st_count = 0, 0, 0
             
             for _ in range(n_events):
                 edges = list(G.edges())
-                if not edges: continue
-                
                 u, v = random.choice(edges)
                 old_w = G[u][v]['weight']
                 new_w = old_w * random.uniform(0.85, 1.15)
+                
+                old_p = parent_curr.copy()
                 G[u][v]['weight'] = new_w
                 
-                if new_w < old_w: _, A_parent = process_edge_decrease(G, d_curr, parent_curr, u, v, new_w, eta)
-                else:             _, A_parent = process_edge_increase(G, d_curr, parent_curr, u, v, new_w, eta)
+                if new_w < old_w:
+                    process_edge_decrease(G, d_curr, parent_curr, children_curr, u, v, new_w, eta)
+                else:
+                    process_edge_increase(G, d_curr, parent_curr, children_curr, u, v, eta)
                 
-                total_churn += len(A_parent)
+                total_churn += get_affected_metrics(G, old_p, parent_curr)
                 
+                d_opt_after, _, _ = compute_initial_tree(G, src)
+                
+                if eta == 0.0:
+                    for n in G.nodes():
+                        if d_opt_after[n] != float('inf'):
+                            assert math.isclose(d_curr[n], d_opt_after[n], rel_tol=1e-5)
+
                 for node in G.nodes():
-                    if node != src and d_opt.get(node, float('inf')) != float('inf') and d_curr.get(node, float('inf')) != float('inf'):
-                        d_opt_after, _ = compute_initial_tree(G, src)
+                    if node != src and d_opt_after[node] != float('inf') and d_opt_after[node] > 0:
                         stretch = max(1.0, d_curr[node] / d_opt_after[node])
                         total_stretch += stretch
                         st_count += 1
-                G[u][v]['weight'] = old_w
                 
             ch_vals.append(total_churn / n_events)
             if st_count > 0: st_vals.append(total_stretch / st_count)
             
         results['churn'].append(np.mean(ch_vals))
-        results['stretch'].append(np.mean(st_vals) if st_vals else 1.0)
+        results['stretch'].append(np.mean(st_vals))
     return results
 
 def experiment_mesh_ami():
+    """Сравнение локализации обновлений на разных топологиях (Эксперимент 5)."""
     results = {'sizes': SIZES, 'mesh': [], 'ami':[]}
     for n_nodes in SIZES:
         affected = {'mesh': [], 'ami':[]}
         for topo_name, gen_func in [('mesh', generate_mesh), ('ami', generate_ami)]:
             for _ in range(TRIALS):
-                try:
-                    G = gen_func(n_nodes)
-                    if G.number_of_nodes() < 2 or not G.edges(): continue
-                    
-                    src = list(G.nodes())[0]
-                    u, v = random.choice(list(G.edges()))
-                    old_w = G[u][v]['weight']
-                    new_w = old_w * random.uniform(0.5, 1.5)
-                    
-                    d_curr, parent_curr = compute_initial_tree(G, src)
-                    G[u][v]['weight'] = new_w
-                    
-                    if new_w < old_w: A_dist, _ = process_edge_decrease(G, d_curr, parent_curr, u, v, new_w, 0.0)
-                    else:             A_dist, _ = process_edge_increase(G, d_curr, parent_curr, u, v, new_w, 0.0)
-                    
-                    affected[topo_name].append(len(A_dist))
-                    G[u][v]['weight'] = old_w
-                except Exception: pass
+                G = gen_func(n_nodes)
+                if not G.edges(): continue
+                src = list(G.nodes())[0]
+                d_curr, parent_curr, children_curr = compute_initial_tree(G, src)
+                
+                u, v = random.choice(list(G.edges()))
+                old_w = G[u][v]['weight']
+                new_w = old_w * random.uniform(0.5, 1.5)
+                
+                old_d = d_curr.copy()
+                G[u][v]['weight'] = new_w
+                if new_w < old_w:
+                    process_edge_decrease(G, d_curr, parent_curr, children_curr, u, v, new_w, 0.0)
+                else:
+                    process_edge_increase(G, d_curr, parent_curr, children_curr, u, v, 0.0)
+                
+                A_dist = {n for n in G.nodes() if old_d[n] != d_curr[n]}
+                affected[topo_name].append(len(A_dist))
+                
         results['mesh'].append(np.mean(affected['mesh']) if affected['mesh'] else 0)
         results['ami'].append(np.mean(affected['ami']) if affected['ami'] else 0)
     return results
 
 def experiment_stress_test():
+    """Анализ границ применимости в условиях массовых отказов (Эксперимент 6)."""
     ratios = np.linspace(0.01, 0.50, 10)
-    results = {'ratios': ratios * 100, 'full': [], 'inc':[]}
-    n_nodes, G_base = 400, generate_grid(400)
-    src = list(G_base.nodes())[0]
+    results = {'ratios': ratios * 100, 'full':[], 'inc':[]}
+    n_nodes = 400
     
     for r in ratios:
-        f_ops, i_ops =[],[]
+        f_ops, i_ops = [],[]
         for _ in range(10):
-            G, edges = G_base.copy(), list(G_base.edges())
+            G = generate_grid(n_nodes)
+            src = list(G.nodes())[0]
+            edges = list(G.edges())
             k = int(len(edges) * r)
             if k == 0: continue
+            
             removed = random.sample(edges, k)
             
-            # Full Recompute
+            # 1. Эталонный полный пересчет (на изолированной копии)
             G_after = G.copy()
             G_after.remove_edges_from(removed)
             c_full = OpCounter()
-            if G_after.number_of_edges() > 0: run_dijkstra_with_ops(G_after, src, c_full)
-            f_ops.append(c_full.total_ops() if G_after.number_of_edges() > 0 else n_nodes)
+            if G_after.number_of_edges() > 0:
+                run_dijkstra_with_ops(G_after, src, c_full)
+            f_ops.append(c_full.total_ops())
             
-            # Incremental
+            # 2. Инкрементальный пересчет (на изолированной копии)
+            G_sim = G.copy()
+            d_curr, parent_curr, children_curr = compute_initial_tree(G_sim, src)
             c_inc = OpCounter()
-            d_curr, parent_curr = compute_initial_tree(G, src)
-            for (u, v) in removed:
-                G.remove_edge(u, v)
-                process_edge_increase(G, d_curr, parent_curr, u, v, float('inf'), 0.0, c_inc)
+            for u, v in removed:
+                process_edge_removal(G_sim, d_curr, parent_curr, children_curr, u, v, 0.0, c_inc)
             i_ops.append(c_inc.total_ops())
             
         results['full'].append(np.mean(f_ops))
@@ -363,48 +422,89 @@ def experiment_stress_test():
 
 # --- ПОСТРОЕНИЕ ГРАФИКОВ ---
 def plot_results(res1, res2, res3, res4):
-    def save_plot(name): plt.grid(True, alpha=0.3); plt.tight_layout(); plt.savefig(f'graphs/{name}.png', dpi=300); plt.close()
+    def save_plot(name): 
+        plt.grid(True, alpha=0.3); plt.tight_layout()
+        plt.savefig(f'graphs/{name}.png', dpi=300); plt.close()
     
     # 1. Complexity
     plt.figure(figsize=(8, 5)); plt.title('Рис. 1. Сравнение вычислительной сложности')
-    plt.plot(res1['sizes'], res1['full'], 'r-o', label='Dijkstra')
-    plt.plot(res1['sizes'], res1['astar'], 'g--s', label='A*')
-    plt.plot(res1['sizes'], res1['inc'], 'b-^', label='Proposed Incr')
-    plt.xlabel('Размер сети |V|'); plt.ylabel('Операции'); plt.legend(); save_plot('exp1_complex')
+    plt.plot(res1['sizes'], res1['full'], 'r-o', label='Полный пересчет (Dijkstra)')
+    plt.plot(res1['sizes'], res1['astar'], 'g--s', label='A* (эвристический)')
+    plt.plot(res1['sizes'], res1['inc'], 'b-^', label='Инкрементальный (Предлож.)')
+    plt.xlabel('Размер сети |V|'); plt.ylabel('Вычислительные затраты (операции)')
+    plt.legend(); save_plot('exp1_complex')
 
-    # 2. Churn & Stretch
-    plt.figure(figsize=(8, 5)); plt.title('Рис. 2. Дрожание маршрутов от η')
+    # 2. Churn
+    plt.figure(figsize=(8, 5)); plt.title('Рис. 2. Зависимость Route Churn от порога η')
     plt.plot(res2['eta'], res2['churn'], 'D-', color='purple')
-    plt.xlabel('η'); plt.ylabel('Churn'); save_plot('exp2_churn')
+    plt.xlabel('Порог стабилизации η'); plt.ylabel('Дрожание маршрутов (Churn)')
+    save_plot('exp2_churn')
     
-    plt.figure(figsize=(8, 5)); plt.title('Рис. 3. Качество пути от η')
+    # 3. Stretch
+    plt.figure(figsize=(8, 5)); plt.title('Рис. 3. Зависимость качества пути от порога η')
     plt.plot(res2['eta'], res2['stretch'], '^-', color='orange')
-    plt.xlabel('η'); plt.ylabel('Stretch'); save_plot('exp2_stretch')
+    plt.xlabel('Порог стабилизации η'); plt.ylabel('Относительное удлинение пути (Stretch)')
+    save_plot('exp2_stretch')
 
-    # 3. Trade-off
-    plt.figure(figsize=(8, 5)); plt.title('Рис. 4. Trade-off: Качество vs Стабильность')
+    # 4. Trade-off
+    plt.figure(figsize=(8, 5)); plt.title('Рис. 4. Компромисс "Качество vs Стабильность"')
     sc = plt.scatter(res2['stretch'], res2['churn'], c=res2['eta'], cmap='viridis', s=100, zorder=2)
     plt.plot(res2['stretch'], res2['churn'], 'k--', alpha=0.3, zorder=1)
-    plt.colorbar(sc, label='Порог η'); plt.xlabel('Stretch'); plt.ylabel('Churn'); save_plot('exp2_tradeoff')
+    plt.colorbar(sc, label='Порог η')
+    plt.xlabel('Качество (Stretch, 1.0 = оптимум)'); plt.ylabel('Нестабильность (Churn)')
+    save_plot('exp2_tradeoff')
 
-    # 4. Mesh vs AMI
-    plt.figure(figsize=(8, 5)); plt.title('Рис. 5. Влияние топологии')
-    plt.plot(res3['sizes'], res3['mesh'], 'b-o', label='Mesh')
-    plt.plot(res3['sizes'], res3['ami'], 'r-s', label='AMI')
-    plt.xlabel('|V|'); plt.ylabel('|A_dist|'); plt.legend(); save_plot('exp3_topo')
+    # 5. Topologies
+    plt.figure(figsize=(8, 5)); plt.title('Рис. 5. Сравнение поведения на mesh и AMI топологиях')
+    plt.plot(res3['sizes'], res3['mesh'], 'b-o', label='Mesh-топологии')
+    plt.plot(res3['sizes'], res3['ami'], 'r-s', label='AMI-топологии')
+    plt.xlabel('Размер сети |V|'); plt.ylabel('Размер области влияния |A_dist|')
+    plt.legend(); save_plot('exp3_topo')
 
-    # 5. Stress Test
-    plt.figure(figsize=(8, 5)); plt.title('Рис. 6. Границы эффективности (Massive Failure)')
-    plt.plot(res4['ratios'], res4['full'], 'r-o', label='Dijkstra')
-    plt.plot(res4['ratios'], res4['inc'], 'b-s', label='Proposed Incr')
-    plt.xlabel('% отказов'); plt.ylabel('Операции'); plt.legend(); save_plot('exp4_stress')
+    # 6. Stress Test (С добавлением точки пересечения)
+    plt.figure(figsize=(8, 5)); plt.title('Рис. 6. Границы эффективности алгоритма при массовых отказах')
+    plt.plot(res4['ratios'], res4['full'], 'r-o', label='Полный пересчет (Dijkstra)')
+    plt.plot(res4['ratios'], res4['inc'], 'b-s', label='Инкрементальный (Предлож.)')
+    
+    # Поиск точной точки пересечения линий (линейная интерполяция)
+    x_vals = res4['ratios']
+    y_full = res4['full']
+    y_inc = res4['inc']
+    intersection_x = None
+    
+    for i in range(len(x_vals) - 1):
+        if y_inc[i] <= y_full[i] and y_inc[i+1] > y_full[i+1]:
+            d0 = y_full[i] - y_inc[i]
+            d1 = y_full[i+1] - y_inc[i+1]
+            t = d0 / (d0 - d1)
+            intersection_x = x_vals[i] + t * (x_vals[i+1] - x_vals[i])
+            break
+            
+    if intersection_x is not None:
+        plt.axvline(x=intersection_x, color='gray', linestyle='--', alpha=0.8, 
+                    label=f'Граница эффективности (~{intersection_x:.1f}%)')
+        
+    plt.xticks(np.arange(0, max(x_vals) + 5, 5))
+    plt.xlabel('Доля отказавших ребер (%)')
+    plt.ylabel('Вычислительные затраты (операции)')
+    plt.legend()
+    save_plot('exp4_stress')
 
-# --- ЗАПУСК ---
+# --- ЗАПУСК ПРОГРАММЫ ---
 if __name__ == "__main__":
-    print("Запуск экспериментов...")
-    r1 = experiment_complexity(); print("ЭКСП 1 завершен")
-    r2 = experiment_stability(); print("ЭКСП 2 завершен")
-    r3 = experiment_mesh_ami(); print("ЭКСП 3 завершен")
-    r4 = experiment_stress_test(); print("ЭКСП 4 завершен")
+    print("Запуск экспериментального исследования...")
+    
+    r1 = experiment_complexity()
+    print("Эксперимент 1 (Вычислительная сложность) завершен.")
+    
+    r2 = experiment_stability()
+    print("Эксперименты 2, 3, 4 (Стабильность, Stretch, Trade-off) завершены.")
+    
+    r3 = experiment_mesh_ami()
+    print("Эксперимент 5 (Влияние топологии) завершен.")
+    
+    r4 = experiment_stress_test()
+    print("Эксперимент 6 (Массовые отказы) завершен.")
+    
     plot_results(r1, r2, r3, r4)
-    print("Графики сохранены в /graphs")
+    print("\nИсследование успешно выполнено. Графики сохранены в директорию '/graphs'.")
