@@ -23,15 +23,18 @@
    git clone https://github.com/Adamosig/incremental-routing-simulator.git
    cd incremental-routing-simulator
 2. Создайте виртуальное окружение (опционально):
-  python -m venv venv
-  source venv/bin/activate  # Linux/macOS
-  venv\Scripts\activate     # Windows
-3. Установите зависимости:
-  pip install -r requirements.txt
+   ```bash
+   python -m venv venv
+   source venv/bin/activate  # Linux/macOS
+   venv\Scripts\activate     # Windows
+4. Установите зависимости:
+   ```bash
+   pip install -r requirements.txt
 
 ## Запуск
-python code_of_article.py
-
+   ```bash
+   python code_of_article.py
+   ```
 Скрипт выполнит все 4 эксперимента и сохранит графики в папку ./graphs/.
 Ожидаемое время выполнения: от минуты (зависит от производительности компьютера).
 
