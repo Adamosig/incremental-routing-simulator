@@ -36,17 +36,18 @@
    python code_of_article.py
    ```
 Скрипт выполнит все 4 эксперимента и сохранит графики в папку ./graphs/.
+
 Ожидаемое время выполнения: от минуты (зависит от производительности компьютера).
 
 ## Результаты
 После успешного выполнения в папке ./graphs/ появятся файлы:
 
-exp1_complex.png
-exp2_churn.png
-exp2_stretch.png
-exp2_tradeoff.png
-exp3_topo.png
-exp4_stress.png
+exp1_complex.png,
+exp2_churn.png,
+exp2_stretch.png,
+exp2_tradeoff.png,
+exp3_topo.png,
+exp4_stress.png,
 
 ## Воспроизводимость
 Фиксированный seed: 42 для random и numpy
