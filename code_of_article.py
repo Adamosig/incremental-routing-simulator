@@ -2,9 +2,11 @@ import os
 import math
 import random
 import heapq
+import time
 import networkx as nx
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy import stats
 
 # --- КОНФИГУРАЦИЯ ЭКСПЕРИМЕНТОВ ---
 random.seed(42)
@@ -19,16 +21,27 @@ BA_M = 3
 SW_K = 6
 SW_P = 0.3
 
-
+# --- СТРУКТУРЫ ДАННЫХ И СЧЕТЧИКИ (ИСПРАВЛЕНО: п.1 - унификация метрики) ---
 class OpCounter:
-    """Счётчик базовых операций: извлечений из очереди и релаксаций рёбер."""
-
+    """Счётчик операций с разделением по типам."""
     def __init__(self):
-        self.relax = 0
-        self.pop = 0
+        self.pq_pop = 0      # извлечения из приоритетной очереди
+        self.relax = 0       # релаксации рёбер
+        self.tree_scan = 0   # обход поддерева при увеличении веса
+        self.boundary_scan = 0 # проверка граничных рёбер
 
     def total_ops(self):
-        return self.relax + self.pop
+        # Возвращает сумму всех операций для общего сравнения
+        return self.pq_pop + self.relax + self.tree_scan + self.boundary_scan
+    
+    def get_metrics(self):
+        # Для детального анализа
+        return {
+            'pq_pop': self.pq_pop,
+            'relax': self.relax,
+            'tree_scan': self.tree_scan,
+            'boundary_scan': self.boundary_scan
+        }
 
 
 def euclidean_heuristic(u, v, G):
@@ -69,7 +82,7 @@ def compute_initial_tree(G, source, c=None):
 
         visited[u] = True
         if c:
-            c.pop += 1
+            c.pq_pop += 1
 
         for v in G.neighbors(u):
             if not visited[v]:
@@ -141,17 +154,19 @@ def generate_small_world(n, k=SW_K, p=SW_P):
 
 
 def generate_mesh(n, extra_edges_ratio=0.05):
-    """Ячеистая топология на основе решётки с дополнительными рёбрами."""
+    """Ячеистая топология на основе решётки с дополнительными локальными рёбрами."""
     G = generate_grid(n)
     nodes = list(G.nodes())
     edges_to_add = int(G.number_of_nodes() * extra_edges_ratio)
     added = 0
+    radius = 2.5  # Радиус локальности для дополнительных связей
     while added < edges_to_add:
         u, v = random.sample(nodes, 2)
         if not G.has_edge(u, v):
             dist = math.dist(G.nodes[u]['pos'], G.nodes[v]['pos'])
-            G.add_edge(u, v, weight=dist)
-            added += 1
+            if dist < radius * math.sqrt(2): # Ограничение по радиусу
+                G.add_edge(u, v, weight=dist)
+                added += 1
     return G
 
 
@@ -160,9 +175,9 @@ def generate_ami(n):
     return generate_rgg(n, RGG_RADIUS)
 
 
-# --- БАЗОВЫЕ АЛГОРИТМЫ ---
+# --- БАЗОВЫЕ АЛГОРИТМЫ (ИСПРАВЛЕНО: п.1 - симметричный подсчет операций) ---
 def run_dijkstra_with_ops(G, source, c):
-    """Полный пересчёт деревa кратчайших путей."""
+    """Полный пересчёт дерева кратчайших путей."""
     d = {v: float('inf') for v in G.nodes()}
     parent = {v: None for v in G.nodes()}
     visited = {v: False for v in G.nodes()}
@@ -172,12 +187,11 @@ def run_dijkstra_with_ops(G, source, c):
 
     while Q:
         dist_u, u = heapq.heappop(Q)
-
         if visited[u] or dist_u > d[u]:
             continue
 
         visited[u] = True
-        c.pop += 1
+        c.pq_pop += 1
 
         for v in G.neighbors(u):
             if not visited[v]:
@@ -200,7 +214,7 @@ def run_astar_with_ops(G, source, target, heuristic, c):
 
     while open_set:
         f_curr, g_curr, curr = heapq.heappop(open_set)
-        c.pop += 1
+        c.pq_pop += 1
         if g_curr > g_score[curr]:
             continue
         closed_set.add(curr)
@@ -221,7 +235,7 @@ def run_astar_with_ops(G, source, target, heuristic, c):
     raise nx.NetworkXNoPath()
 
 
-# --- ИНКРЕМЕНТАЛЬНЫЙ АЛГОРИТМ ---
+# --- ИНКРЕМЕНТАЛЬНЫЙ АЛГОРИТМ (ИСПРАВЛЕНО: п.1 - симметричный подсчет) ---
 def process_edge_decrease(G, d, parent, children, u, v, w_new, eta, c=None):
     """Обработка уменьшения веса ребра."""
     Q = []
@@ -243,7 +257,7 @@ def process_edge_decrease(G, d, parent, children, u, v, w_new, eta, c=None):
             continue
         processed.add(x)
         if c:
-            c.pop += 1
+            c.pq_pop += 1
 
         for y in G.neighbors(x):
             if y not in processed:
@@ -276,7 +290,7 @@ def process_edge_increase(G, d, parent, children, u, v, eta, c=None):
                 continue
             descendants.add(node)
             if c:
-                c.pop += 1
+                c.tree_scan += 1 # Операция обхода поддерева
             stack.extend(children.get(node, set()))
 
     for z in descendants:
@@ -292,7 +306,7 @@ def process_edge_increase(G, d, parent, children, u, v, eta, c=None):
                 edge_key = tuple(sorted([z, y]))
                 if edge_key not in processed_relax:
                     if c:
-                        c.relax += 1
+                        c.boundary_scan += 1 # Операция проверки границы
                     processed_relax.add(edge_key)
 
                 w = G[y][z]['weight']
@@ -312,7 +326,7 @@ def process_edge_increase(G, d, parent, children, u, v, eta, c=None):
                 continue
             processed.add(x)
             if c:
-                c.pop += 1
+                c.pq_pop += 1
 
             for y in G.neighbors(x):
                 if y not in processed:
@@ -335,10 +349,12 @@ def process_edge_removal(G, d, parent, children, u, v, eta, c=None):
     process_edge_increase(G, d, parent, children, u, v, eta, c)
 
 
-# --- СБОР МЕТРИК ---
-def get_affected_metrics(G, old_p, new_p):
-    """Количество вершин, сменивших родителя."""
-    return len({n for n in G.nodes() if old_p.get(n) != new_p.get(n)})
+# --- СБОР МЕТРИК (ИСПРАВЛЕНО: п.8 - единый интерфейс для A_dist и A_parent) ---
+def get_affected_metrics(G, old_d, new_d, old_p, new_p):
+    """Возвращает размеры множеств A_dist и A_parent."""
+    A_dist = {n for n in G.nodes() if not math.isclose(old_d[n], new_d[n], rel_tol=1e-7)}
+    A_parent = {n for n in G.nodes() if old_p.get(n) != new_p.get(n)}
+    return len(A_dist), len(A_parent)
 
 
 # --- ЭКСПЕРИМЕНТЫ ---
@@ -431,6 +447,7 @@ def experiment_stability():
                 new_w = old_w * random.uniform(0.85, 1.15)
 
                 old_p = parent_curr.copy()
+                old_d = d_curr.copy()
                 G[u][v]['weight'] = new_w
 
                 if new_w < old_w:
@@ -440,7 +457,9 @@ def experiment_stability():
                     process_edge_increase(G, d_curr, parent_curr, children_curr,
                                           u, v, eta)
 
-                total_churn += get_affected_metrics(G, old_p, parent_curr)
+                _, A_parent_len = get_affected_metrics(G, old_d, d_curr, old_p, parent_curr)
+                total_churn += A_parent_len
+                
                 d_opt_after, _, _ = compute_initial_tree(G, src)
 
                 if eta == 0.0:
@@ -470,9 +489,9 @@ def experiment_stability():
 
 def experiment_mesh_ami():
     """Эксперимент 5: размер области влияния для Mesh и AMI."""
-    results = {'sizes': SIZES, 'mesh': [], 'ami': []}
+    results = {'sizes': SIZES, 'mesh_A_dist': [], 'ami_A_dist': []}
     for n_nodes in SIZES:
-        affected = {'mesh': [], 'ami': []}
+        affected_mesh, affected_ami = [], []
         for topo_name, gen_func in [('mesh', generate_mesh),
                                     ('ami', generate_ami)]:
             for _ in range(TRIALS):
@@ -489,6 +508,7 @@ def experiment_mesh_ami():
                 new_w = old_w * random.uniform(0.5, 1.5)
 
                 old_d = d_curr.copy()
+                old_p = parent_curr.copy()
                 G[u][v]['weight'] = new_w
                 if new_w < old_w:
                     process_edge_decrease(G, d_curr, parent_curr, children_curr,
@@ -497,15 +517,15 @@ def experiment_mesh_ami():
                     process_edge_increase(G, d_curr, parent_curr, children_curr,
                                           u, v, 0.0)
 
-                A_dist = {n for n in G.nodes()
-                          if not math.isclose(old_d[n], d_curr[n],
-                                              rel_tol=1e-7)}
-                affected[topo_name].append(len(A_dist))
+                A_dist_len, _ = get_affected_metrics(G, old_d, d_curr, old_p, parent_curr)
+                
+                if topo_name == 'mesh':
+                    affected_mesh.append(A_dist_len)
+                else:
+                    affected_ami.append(A_dist_len)
 
-        results['mesh'].append(np.mean(affected['mesh'])
-                               if affected['mesh'] else 0)
-        results['ami'].append(np.mean(affected['ami'])
-                              if affected['ami'] else 0)
+        results['mesh_A_dist'].append(np.mean(affected_mesh) if affected_mesh else 0)
+        results['ami_A_dist'].append(np.mean(affected_ami) if affected_ami else 0)
     return results
 
 
@@ -593,11 +613,13 @@ def experiment_stress_test():
     if all_intersections:
         mean_intersect = np.mean(all_intersections)
         std_intersect = np.std(all_intersections)
-        print(f"  Граница эффективности: {mean_intersect:.2f}% "
-              f"± {std_intersect:.2f}%")
+        # ИСПРАВЛЕНО: п.4 - Расчет 95% доверительного интервала вместо просто std
+        ci_intersect = stats.t.interval(0.95, len(all_intersections)-1, loc=mean_intersect, scale=stats.sem(all_intersections))
+        print(f"  Граница эффективности: {mean_intersect:.2f}% (95% CI: [{ci_intersect[0]:.2f}%, {ci_intersect[1]:.2f}%])")
     else:
         mean_intersect = None
-        std_intersect = None
+        ci_intersect = (None, None)
+        print("  Внимание: точка пересечения не найдена")
 
     results = {
         'ratios': ratios * 100,
@@ -608,13 +630,14 @@ def experiment_stress_test():
     }
     intersection_stats = {
         'mean': mean_intersect,
-        'std': std_intersect,
+        'std': std_intersect if all_intersections else None,
+        'ci': ci_intersect,
         'all_values': all_intersections
     }
     return results, intersection_stats
 
 
-# --- ПОСТРОЕНИЕ ГРАФИКОВ ---
+# --- ПОСТРОЕНИЕ ГРАФИКОВ (ИСПРАВЛЕНО: п.6, п.9) ---
 def plot_results(res1, res2, res3, res4, intersect_stats):
     """Формирование и сохранение всех графиков."""
     def save_plot(name):
@@ -623,7 +646,7 @@ def plot_results(res1, res2, res3, res4, intersect_stats):
         plt.savefig(f'graphs/{name}.png', dpi=300)
         plt.close()
 
-    # Рис. 1: Вычислительная сложность
+    # Рис. 1: Вычислительная сложность (A* как справочный ориентир)
     plt.figure(figsize=(8, 5))
     plt.title('Рис. 1. Сравнение вычислительной сложности')
     plt.plot(res1['sizes'], res1['full'], 'r-o', label='Полный пересчет')
@@ -660,7 +683,7 @@ def plot_results(res1, res2, res3, res4, intersect_stats):
     plt.ylabel('Относительное удлинение пути (Stretch)')
     save_plot('exp2_stretch')
 
-    # Рис. 4: Trade-off (ч/б версия с маркерами)
+    # Рис. 4: Trade-off
     plt.figure(figsize=(10, 7))
     plt.title('Рис. 4. Компромисс "Качество vs Стабильность"')
     x_vals = res2['stretch_mean']
@@ -685,19 +708,19 @@ def plot_results(res1, res2, res3, res4, intersect_stats):
     plt.ylim(min(y_vals) - y_margin, max(y_vals) + y_margin)
     save_plot('exp2_tradeoff')
 
-    # Рис. 5: Mesh vs AMI
+    # Рис. 5: Mesh vs AMI (ИСПРАВЛЕНО: п.3 - явное указание на размер области влияния)
     plt.figure(figsize=(8, 5))
-    plt.title('Рис. 5. Сравнение поведения на mesh и AMI топологиях')
-    plt.plot(res3['sizes'], res3['mesh'], 'b-o', label='Mesh-топологии')
-    plt.plot(res3['sizes'], res3['ami'], 'r-s', label='AMI-топологии')
+    plt.title('Рис. 5. Размер области влияния на mesh и AMI топологиях')
+    plt.plot(res3['sizes'], res3['mesh_A_dist'], 'b-o', label='Mesh-топологии')
+    plt.plot(res3['sizes'], res3['ami_A_dist'], 'r-s', label='AMI-топологии')
     plt.xlabel('Размер сети |V|')
     plt.ylabel('Размер области влияния |A_dist|')
     plt.legend()
     save_plot('exp3_topo')
 
-    # Рис. 6: Stress Test
+    # Рис. 6: Stress Test (ИСПРАВЛЕНО: п.4, п.5, п.9 - CI вместо std, ограничение Grid)
     plt.figure(figsize=(9, 6))
-    plt.title('Рис. 6. Границы эффективности при серии отказов')
+    plt.title('Рис. 6. Границы эффективности при серии отказов (регулярная решётка)')
     x = res4['ratios']
 
     plt.plot(x, res4['full_mean'], 'r-o', label='Полный пересчет', linewidth=2)
@@ -714,12 +737,10 @@ def plot_results(res1, res2, res3, res4, intersect_stats):
 
     if intersect_stats['mean'] is not None:
         mean_val = intersect_stats['mean']
-        std_val = intersect_stats['std'] or 0.5
+        ci = intersect_stats['ci']
         plt.axvline(x=mean_val, color='gray', linestyle='--', linewidth=1.5,
-                    label=f'Граница эффективности ({mean_val:.2f}% '
-                          f'± {std_val:.2f}%)')
-        plt.axvspan(mean_val - std_val, mean_val + std_val,
-                    alpha=0.12, color='gray')
+                    label=f'Граница эффективности ({mean_val:.2f}%, 95% CI: [{ci[0]:.2f}%, {ci[1]:.2f}%])')
+        plt.axvspan(ci[0], ci[1], alpha=0.12, color='gray')
 
         y_max = plt.ylim()[1]
         plt.annotate(f'{mean_val:.2f}%', xy=(mean_val, y_max * 0.5),
@@ -745,10 +766,10 @@ if __name__ == "__main__":
     print("\n[2/4] Стабильность (Churn, Stretch)...")
     r2 = experiment_stability()
 
-    print("\n[3/4] Топологии Mesh и AMI...")
+    print("\n[3/4] Топологии Mesh и AMI (размер области влияния)...")
     r3 = experiment_mesh_ami()
 
-    print("\n[4/4] Стресс-тест (массовые отказы)...")
+    print("\n[4/4] Стресс-тест (границы применимости на решётке)...")
     r4, intersect_stats = experiment_stress_test()
 
     print("\n=== ПОСТРОЕНИЕ ГРАФИКОВ ===")
@@ -763,7 +784,7 @@ if __name__ == "__main__":
                            / r2['churn_mean'][0] * 100)
         stretch_value = (r2['stretch_mean'][idx] - 1.0) * 100
         print(f"\nГраница эффективности: {intersect_stats['mean']:.2f}% "
-              f"± {intersect_stats['std']:.2f}%")
+              f"(95% CI: [{intersect_stats['ci'][0]:.2f}%, {intersect_stats['ci'][1]:.2f}%])")
         print(f"Снижение Churn при η=0.15: ~{churn_reduction:.1f}%")
         print(f"Удлинение пути при η=0.15: ~{stretch_value:.2f}%")
 
